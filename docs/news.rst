@@ -3,6 +3,21 @@ Release Notes
 
 **UNRELEASED**
 
+- Changed ``WheelFile.write`` to stream file contents into the archive in fixed
+  size chunks instead of reading the whole member into memory, so writing large
+  resources (such as bundled model files) no longer loads the entire file at
+  once. The RECORD hash and size are computed from the same chunks that are
+  written, guaranteeing they match the archived bytes even if the source changes
+  or disappears during the read
+- Made a failed member write fail the whole session: further ``write``/
+  ``writestr`` calls are rejected and closing no longer synthesizes a RECORD
+  that would present the truncated archive as complete; the result is left as a
+  visibly invalid wheel instead
+- Made ``WheelFile.write`` and ``WheelFile.writestr`` reject duplicate member
+  names with a ``WheelError`` instead of appending a second entry (which
+  previously only triggered a warning)
+- Fixed ``WheelFile.write`` ignoring an explicit ``ZIP_STORED`` (``0``)
+  ``compress_type`` because the value was treated as falsy
 - Fixed ``wheel unpack`` taking the mode of the unpack directory itself from the
   archive when a wheel contains a member whose name is made up entirely of empty,
   ``.`` or ``..`` path components (such as ``../``), which let a malicious wheel

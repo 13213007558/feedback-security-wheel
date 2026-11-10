@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import base64
+import builtins
+import csv
+import hashlib
+import io
 import stat
 import sys
 from pathlib import Path
-from zipfile import ZIP_DEFLATED, ZipFile
+from zipfile import ZIP_DEFLATED, ZIP_STORED, BadZipFile, ZipFile, ZipInfo
 
 import pytest
 from pytest import MonkeyPatch, TempPathFactory
 
-from wheel.wheelfile import WheelError, WheelFile
+from wheel.wheelfile import CHUNK_SIZE, WheelError, WheelFile
 
 
 @pytest.fixture
@@ -229,3 +234,293 @@ def test_attributes(tmp_path_factory: TempPathFactory, wheel_path: Path) -> None
 
         info = zf.getinfo("test-1.0.dist-info/RECORD")
         assert info.external_attr == (0o664 | stat.S_IFREG) << 16
+
+
+class RecordingBytesReader(io.BytesIO):
+    """In-memory file stand-in that records the size of every read() request.
+
+    The descriptor comes from the real source file so ``os.fstat`` (used for
+    permissions and the timestamp) keeps working unchanged.
+    """
+
+    def __init__(self, data: bytes, source: Path) -> None:
+        super().__init__(data)
+        self._real_file = source.open("rb")
+        self.read_sizes: list[int] = []
+        self.delivered_sizes: list[int] = []
+
+    def fileno(self) -> int:
+        return self._real_file.fileno()
+
+    def close(self) -> None:
+        self._real_file.close()
+        super().close()
+
+    def read(self, size: int = -1) -> bytes:
+        chunk = super().read(size)
+        if chunk:
+            self.read_sizes.append(size)
+            self.delivered_sizes.append(len(chunk))
+        return chunk
+
+
+class FailingChunkReader(RecordingBytesReader):
+    """Fails on the second chunk read, after one full chunk was streamed."""
+
+    def read(self, size: int = -1) -> bytes:
+        recorded = len(self.read_sizes)
+        chunk = super().read(size)
+        if recorded == 1 and chunk:
+            raise OSError("simulated read failure on second chunk")
+        return chunk
+
+
+def _patch_open(
+    monkeypatch: MonkeyPatch, source: Path, reader: RecordingBytesReader
+) -> None:
+    real_open = builtins.open
+
+    def fake_open(path: object, *args: object, **kwargs: object) -> object:
+        if str(path) == str(source):
+            return reader
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+
+
+def test_write_streams_bounded_chunks(
+    tmp_path: Path, wheel_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    # 2.5 chunks worth of data: two full reads plus a short final one, well
+    # below any "huge file" threshold.
+    payload = bytes((i % 251 for i in range(2 * CHUNK_SIZE + 1024)))
+    source = tmp_path / "model.bin"
+    source.write_bytes(payload)
+    reader = RecordingBytesReader(payload, source)
+    _patch_open(monkeypatch, source, reader)
+
+    with WheelFile(wheel_path, "w") as wf:
+        wf.write(str(source), "data/model.bin")
+
+    # Every read must be bounded by the chunk size; no whole-file reads.
+    assert reader.read_sizes
+    assert max(reader.read_sizes) <= CHUNK_SIZE
+    assert reader.read_sizes == [CHUNK_SIZE, CHUNK_SIZE, CHUNK_SIZE]
+    assert reader.delivered_sizes == [CHUNK_SIZE, CHUNK_SIZE, 1024]
+
+    # Independently verify every byte, the hash and the size with plain
+    # zipfile/hashlib, then cross-check them against RECORD.
+    expected_digest = hashlib.sha256(payload).digest()
+    with ZipFile(wheel_path) as zf:
+        assert zf.namelist() == [
+            "data/model.bin",
+            "test-1.0.dist-info/RECORD",
+        ]
+        info = zf.getinfo("data/model.bin")
+        assert info.file_size == len(payload)
+        assert info.compress_type == ZIP_DEFLATED
+        assert info.external_attr == (0o644 | stat.S_IFREG) << 16
+        stored = zf.read("data/model.bin")
+        assert stored == payload
+        assert hashlib.sha256(stored).digest() == expected_digest
+
+        record_rows = list(
+            csv.reader(io.TextIOWrapper(zf.open("test-1.0.dist-info/RECORD")))
+        )
+
+    record = {row[0]: row[1:] for row in record_rows}
+    algorithm, digest = record["data/model.bin"][0].split("=", 1)
+    assert algorithm == "sha256"
+    pad = "=" * (-len(digest) % 4)
+    assert base64.urlsafe_b64decode(digest + pad) == expected_digest
+    assert int(record["data/model.bin"][1]) == len(payload)
+    assert record["test-1.0.dist-info/RECORD"] == ["", ""]
+
+
+def test_write_preserves_compression_and_stored_mode(
+    tmp_path: Path, wheel_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    payload = b"uncompressed" * 1000
+    source = tmp_path / "blob.bin"
+    source.write_bytes(payload)
+    reader = RecordingBytesReader(payload, source)
+    _patch_open(monkeypatch, source, reader)
+
+    with WheelFile(wheel_path, "w") as wf:
+        wf.write(str(source), "blob.bin", compress_type=ZIP_STORED)
+
+    with ZipFile(wheel_path) as zf:
+        info = zf.getinfo("blob.bin")
+        assert info.compress_type == ZIP_STORED
+        assert info.file_size == len(payload)
+        assert zf.read("blob.bin") == payload
+        assert max(reader.read_sizes) <= CHUNK_SIZE
+
+
+def test_write_hash_tracks_streamed_bytes_when_source_changes(
+    tmp_path: Path, wheel_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    payload = bytes((i % 251 for i in range(CHUNK_SIZE + 512)))
+    source = tmp_path / "model.bin"
+    source.write_bytes(payload)
+    reader = RecordingBytesReader(payload, source)
+    _patch_open(monkeypatch, source, reader)
+
+    original_read = reader.read
+
+    def tamper_on_first_chunk(size: int = -1) -> bytes:
+        chunk = original_read(size)
+        if len(reader.read_sizes) == 1:
+            # Overwrite the source with different content while streaming.
+            source.write_bytes(b"totally different content" * 100)
+        return chunk
+
+    reader.read = tamper_on_first_chunk  # type: ignore[method-assign]
+
+    with WheelFile(wheel_path, "w") as wf:
+        wf.write(str(source), "data/model.bin")
+
+    # RECORD must describe the bytes that were actually streamed, not the
+    # tampered file now sitting on disk.
+    expected_digest = hashlib.sha256(payload).digest()
+    with ZipFile(wheel_path) as zf:
+        stored = zf.read("data/model.bin")
+        assert stored == payload
+        assert hashlib.sha256(stored).digest() == expected_digest
+        rows = list(
+            csv.reader(io.TextIOWrapper(zf.open("test-1.0.dist-info/RECORD")))
+        )
+
+    record = {row[0]: row[1:] for row in rows}
+    _, digest = record["data/model.bin"][0].split("=", 1)
+    pad = "=" * (-len(digest) % 4)
+    assert base64.urlsafe_b64decode(digest + pad) == expected_digest
+    assert int(record["data/model.bin"][1]) == len(payload)
+
+
+def test_write_read_failure_poisons_session(
+    tmp_path: Path, wheel_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    payload = bytes((i % 251 for i in range(2 * CHUNK_SIZE + 1024)))
+    source = tmp_path / "model.bin"
+    source.write_bytes(payload)
+    reader = FailingChunkReader(payload, source)
+    _patch_open(monkeypatch, source, reader)
+
+    wf = WheelFile(wheel_path, "w")
+    with pytest.raises(OSError, match="simulated read failure"):
+        wf.write(str(source), "data/model.bin")
+    assert wf._failed is True
+
+    # A corrupted session cannot accept more members through either entry.
+    with pytest.raises(WheelError, match="failed state"):
+        wf.write(str(source), "other.bin")
+    with pytest.raises(WheelError, match="failed state"):
+        wf.writestr("small.txt", b"payload")
+
+    # Close must not fabricate a RECORD; it stays idempotent and does not raise.
+    wf.close()
+    wf.close()
+    assert wf.fp is None
+
+    # The leftover file is visibly broken rather than a plausible full wheel.
+    with pytest.raises(BadZipFile):
+        with ZipFile(wheel_path) as zf:
+            zf.namelist()
+
+
+def test_write_failure_inside_context_manager(
+    tmp_path: Path, wheel_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    payload = b"x" * (2 * CHUNK_SIZE)
+
+    class TruncatingReader(RecordingBytesReader):
+        def read(self, size: int = -1) -> bytes:
+            chunk = super().read(size)
+            if len(self.read_sizes) == 2 and chunk:
+                raise OSError("source vanished mid-read")
+            return chunk
+
+    source = tmp_path / "model.bin"
+    source.write_bytes(payload)
+    reader = TruncatingReader(payload, source)
+    _patch_open(monkeypatch, source, reader)
+
+    with pytest.raises(OSError, match="source vanished"):
+        with WheelFile(wheel_path, "w") as wf:
+            wf.write(str(source), "data/model.bin")
+
+    with pytest.raises(BadZipFile):
+        with ZipFile(wheel_path) as zf:
+            zf.namelist()
+
+
+@pytest.mark.parametrize(
+    "second_call",
+    [
+        pytest.param(
+            lambda wf, source: wf.write(str(source), "dup.bin"), id="write"
+        ),
+        pytest.param(
+            lambda wf, source: wf.writestr("dup.bin", b"second"), id="writestr"
+        ),
+        pytest.param(
+            lambda wf, source: wf.writestr(ZipInfo("dup.bin"), b"second"),
+            id="writestr-zinfo",
+        ),
+    ],
+)
+def test_duplicate_member_rejected_consistently(
+    tmp_path: Path,
+    wheel_path: Path,
+    monkeypatch: MonkeyPatch,
+    second_call: object,
+) -> None:
+    payload = b"first member"
+    source = tmp_path / "dup.bin"
+    source.write_bytes(payload)
+    reader = RecordingBytesReader(payload, source)
+    _patch_open(monkeypatch, source, reader)
+
+    with WheelFile(wheel_path, "w") as wf:
+        wf.write(str(source), "dup.bin")
+        with pytest.raises(
+            WheelError, match="Duplicate name in archive: 'dup.bin'"
+        ):
+            second_call(wf, source)  # type: ignore[operator]
+
+    # Only the first member plus RECORD made it into the archive.
+    with ZipFile(wheel_path) as zf:
+        assert zf.namelist() == ["dup.bin", "test-1.0.dist-info/RECORD"]
+        assert zf.read("dup.bin") == payload
+
+
+def test_duplicate_member_from_writestr(
+    tmp_path: Path, wheel_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    payload = b"also a file"
+    source = tmp_path / "unused.bin"
+    source.write_bytes(payload)
+    reader = RecordingBytesReader(payload, source)
+    _patch_open(monkeypatch, source, reader)
+
+    with WheelFile(wheel_path, "w") as wf:
+        wf.writestr("dup.bin", b"first")
+        with pytest.raises(
+            WheelError, match="Duplicate name in archive: 'dup.bin'"
+        ):
+            wf.write(str(source), "dup.bin")
+        with pytest.raises(
+            WheelError, match="Duplicate name in archive: 'dup.bin'"
+        ):
+            wf.writestr("dup.bin", b"second")
+
+
+def test_repeated_close_is_idempotent(wheel_path: Path) -> None:
+    wf = WheelFile(wheel_path, "w")
+    wf.writestr("hello.py", b"print('hi')\n")
+    wf.close()
+    wf.close()
+
+    with ZipFile(wheel_path) as zf:
+        assert zf.namelist() == ["hello.py", "test-1.0.dist-info/RECORD"]

@@ -26,6 +26,10 @@ WHEEL_INFO_RE = re.compile(
     re.VERBOSE,
 )
 MINIMUM_TIMESTAMP = 315532800  # 1980-01-01 00:00:00 UTC
+# Size of each chunk streamed from disk into the archive. Keeping this bounded
+# means writing large files (e.g. model resources) never loads the whole member
+# into memory at once.
+CHUNK_SIZE = 1024 * 1024
 
 log = logging.getLogger("wheel")
 
@@ -81,6 +85,10 @@ class WheelFile(ZipFile):
         self.record_path = self.dist_info_path + "/RECORD"
         self._file_hashes: dict[str, tuple[None, None] | tuple[int, bytes]] = {}
         self._file_sizes = {}
+        # Set once a member write fails. A poisoned session refuses further
+        # writes and is closed without synthesizing a RECORD that would claim
+        # the archive is complete.
+        self._failed = False
         if mode == "r":
             # The .dist-info directory inside the wheel may use normalized
             # (lowercase) naming even when the filename does not. Resolve the
@@ -187,22 +195,73 @@ class WheelFile(ZipFile):
         for path, arcname in deferred:
             self.write(path, arcname)
 
+    def _ensure_writable(self) -> None:
+        """Reject any write once the session has been poisoned by a failure."""
+        if self._failed:
+            raise WheelError(
+                "Wheel archive is in a failed state and can no longer be written to"
+            )
+
+    def _check_duplicate(self, fname: str) -> None:
+        """Reject duplicate members before any data is written.
+
+        Both :meth:`write` and :meth:`writestr` go through this check so that
+        the two entry points behave identically instead of silently appending
+        a second entry (which only triggers a stdlib warning).
+        """
+        if fname in self.NameToInfo:
+            raise WheelError(f"Duplicate name in archive: {fname!r}")
+
     def write(
         self,
         filename: str,
         arcname: str | None = None,
         compress_type: int | None = None,
     ) -> None:
-        with open(filename, "rb") as f:
-            st = os.fstat(f.fileno())
-            data = f.read()
+        self._ensure_writable()
+        arcname = arcname or filename
+        self._check_duplicate(arcname)
 
-        zinfo = ZipInfo(
-            arcname or filename, date_time=get_zipinfo_datetime(st.st_mtime)
+        zinfo = ZipInfo(arcname)
+        zinfo.compress_type = (
+            self.compression if compress_type is None else compress_type
         )
-        zinfo.external_attr = (stat.S_IMODE(st.st_mode) | stat.S_IFMT(st.st_mode)) << 16
-        zinfo.compress_type = compress_type or self.compression
-        self.writestr(zinfo, data, compress_type)
+
+        # The digest, size and ZIP payload are all derived from the same
+        # streaming read. The file is never re-opened or re-read, so the
+        # hashed bytes are guaranteed to match what ends up in the archive
+        # even if the source changes or disappears halfway through.
+        digest = self._default_algorithm()
+        file_size = 0
+        try:
+            with open(filename, "rb") as f:
+                st = os.fstat(f.fileno())
+                zinfo.date_time = get_zipinfo_datetime(st.st_mtime)
+                zinfo.external_attr = (
+                    stat.S_IMODE(st.st_mode) | stat.S_IFMT(st.st_mode)
+                ) << 16
+
+                with ZipFile.open(self, zinfo, mode="w") as dest:
+                    while True:
+                        chunk = f.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        dest.write(chunk)
+                        digest.update(chunk)
+                        file_size += len(chunk)
+        except BaseException:
+            # The member on disk is now truncated and the session is
+            # poisoned: no further writes, no fabricated RECORD on close.
+            self._failed = True
+            raise
+
+        log.info("adding %r", arcname)
+        if arcname != self.record_path:
+            self._file_hashes[arcname] = (
+                digest.name,
+                urlsafe_b64encode(digest.digest()).decode("ascii"),
+            )
+            self._file_sizes[arcname] = file_size
 
     def writestr(
         self,
@@ -210,6 +269,7 @@ class WheelFile(ZipFile):
         data: SizedBuffer | str,
         compress_type: int | None = None,
     ) -> None:
+        self._ensure_writable()
         if isinstance(zinfo_or_arcname, str):
             zinfo_or_arcname = ZipInfo(
                 zinfo_or_arcname, date_time=get_zipinfo_datetime()
@@ -217,15 +277,18 @@ class WheelFile(ZipFile):
             zinfo_or_arcname.compress_type = self.compression
             zinfo_or_arcname.external_attr = (0o664 | stat.S_IFREG) << 16
 
+        fname = zinfo_or_arcname.filename
+        self._check_duplicate(fname)
+
         if isinstance(data, str):
             data = data.encode("utf-8")
 
-        ZipFile.writestr(self, zinfo_or_arcname, data, compress_type)
-        fname = (
-            zinfo_or_arcname.filename
-            if isinstance(zinfo_or_arcname, ZipInfo)
-            else zinfo_or_arcname
-        )
+        try:
+            ZipFile.writestr(self, zinfo_or_arcname, data, compress_type)
+        except BaseException:
+            self._failed = True
+            raise
+
         log.info("adding %r", fname)
         if fname != self.record_path:
             hash_ = self._default_algorithm(data)
@@ -236,6 +299,21 @@ class WheelFile(ZipFile):
             self._file_sizes[fname] = len(data)
 
     def close(self) -> None:
+        # ``__del__`` may run if ``__init__`` failed before the object was
+        # fully initialized; in that case there is nothing of ours to close.
+        if getattr(self, "_failed", False):
+            # Never emit a RECORD for a poisoned session: that would present
+            # a truncated member as a complete, verified archive. Skip the
+            # central directory as well so the result is visibly not a valid
+            # wheel rather than a plausible-looking one. Like a normal close,
+            # this is idempotent and safe to call more than once.
+            self._failed = False
+            fp = self.fp
+            self.fp = None
+            if fp is not None:
+                self._fpclose(fp)
+            return
+
         # Write RECORD
         if self.fp is not None and self.mode == "w" and self._file_hashes:
             data = StringIO()

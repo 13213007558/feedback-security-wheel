@@ -3,6 +3,16 @@ Release Notes
 
 **UNRELEASED**
 
+- Replaced the private ``ZipExtFile._update_crc`` monkey patch used by
+  ``WheelFile.open()`` with a public binary IO wrapper (``VerifyingReader``)
+  that checks the ``RECORD`` digest, the declared file size and the ZIP CRC-32
+  through the standard IO interface.  Readers now expose a ``verified``
+  attribute so callers can tell whether a member was actually read to the end
+  and fully verified; members closed early or abandoned mid-read stay
+  unverified instead of being reported as checked.  Integrity failures
+  continue to be raised as ``WheelError`` (with the original exception kept as
+  the cause), while ``RECORD`` itself and signature members remain exempt from
+  digest checking
 - Fixed ``wheel unpack`` taking the mode of the unpack directory itself from the
   archive when a wheel contains a member whose name is made up entirely of empty,
   ``.`` or ``..`` path components (such as ``../``), which let a malicious wheel
